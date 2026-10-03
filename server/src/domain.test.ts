@@ -1,6 +1,41 @@
-import test from 'node:test'; import assert from 'node:assert/strict'; import { containerPlan, dashboard, gateConflicts, prioritizeTasks } from './domain.js';
+import test from 'node:test'; import assert from 'node:assert/strict'; import { containerPlan, dashboard, gateConflicts, previewAppointmentAdjustment, resolveGateConflict, GateAdjustmentError, prioritizeTasks } from './domain.js';
 test('dashboard aggregates berth, yard, gate and exception signals', () => { const data = dashboard(); assert.equal(data.activeVoyages, 2); assert.ok(data.yardUtilization > 0.7); assert.ok(data.blockedTasks >= 1); });
-test('gate conflict engine detects same truck overlap', () => { const conflicts = gateConflicts(); assert.ok(conflicts.some(item => item.appointmentId === 'APT-9001' || item.appointmentId === 'APT-9004')); });
+test('gate conflict engine separates truck overlap, lane overlap and customs blocks', () => {
+  const conflicts = gateConflicts();
+  const truck = conflicts.find(item => item.kind === 'truck-overlap');
+  assert.ok(truck && truck.severity === 'critical' && truck.otherAppointmentId, '同车重叠应返回双方预约');
+  const customs = conflicts.find(item => item.kind === 'customs-blocked' && item.appointmentId === 'APT-9005');
+  assert.ok(customs && customs.customs === 'inspection', '海关未放行提箱必须单独标识');
+  assert.ok(conflicts.findIndex(item => item.kind === 'truck-overlap') < conflicts.findIndex(item => item.kind === 'customs-blocked'));
+});
+test('conflict preview shows affected appointment and whether a reslot resolves the conflict', () => {
+  const overlap = gateConflicts().find(item => item.kind === 'truck-overlap');
+  assert.ok(overlap);
+  const targetId = overlap.appointmentId;
+  const shifted = new Date(Date.now() + 10 * 60000).toISOString();
+  const stillOverlaps = previewAppointmentAdjustment(targetId, { windowStart: shifted, windowEnd: new Date(Date.now() + 40 * 60000).toISOString(), lane: overlap.primary.lane });
+  assert.equal(stillOverlaps.affected?.appointmentId, overlap.otherAppointmentId);
+  assert.equal(stillOverlaps.resolvesConflict, false);
+  const far = new Date(Date.now() + 300 * 60000).toISOString();
+  const resolved = previewAppointmentAdjustment(targetId, { windowStart: far, windowEnd: new Date(Date.now() + 330 * 60000).toISOString(), lane: overlap.primary.lane });
+  assert.equal(resolved.resolvesConflict, true);
+  assert.equal(resolved.remainingConflictIds.length, 0);
+});
+test('customs blocked pickup cannot be cleared by slot or lane changes', () => {
+  const preview = previewAppointmentAdjustment('APT-9005', { lane: 'north', windowStart: new Date(Date.now() + 300 * 60000).toISOString(), windowEnd: new Date(Date.now() + 330 * 60000).toISOString() });
+  assert.equal(preview.customsBlocked, true);
+  assert.equal(preview.resolvesConflict, false);
+  assert.throws(() => resolveGateConflict('APT-9005', 'customs-blocked:APT-9005', { lane: 'north' }), (error: unknown) => error instanceof GateAdjustmentError && error.code === 'customs-hold');
+});
+test('saving an already handled conflict is rejected with conflict-changed', () => {
+  const overlap = gateConflicts().find(item => item.kind === 'truck-overlap');
+  assert.ok(overlap);
+  assert.throws(
+    () => resolveGateConflict(overlap.appointmentId, 'truck-overlap:APT-0000|APT-9999', {}),
+    (error: unknown) => error instanceof GateAdjustmentError && error.code === 'conflict-changed'
+  );
+});
+
 test('yard planner respects reefer and hazmat constraints', () => { const plan = containerPlan('TGHU-9831204'); assert.equal(plan?.recommendedBlock?.hazmatAllowed, true); assert.ok(plan?.reasons.some(reason => reason.includes('危险品'))); });
 test('priority queue promotes customs inspection work', () => { const tasks = prioritizeTasks(); assert.equal(tasks[0].containerId, 'TGHU-9831204'); });
 

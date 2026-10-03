@@ -1,5 +1,5 @@
 import express from 'express';
-import { appointments, assignTask, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, prioritizeTasks, tasks, updateContainer, updateYardTask, voyages, yardHeatmap } from './domain.js';
+import { appointments, assignTask, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, previewAppointmentAdjustment, prioritizeTasks, resolveGateConflict, GateAdjustmentError, tasks, updateContainer, updateYardTask, voyages, yardHeatmap } from './domain.js';
 const app = express(); app.use(express.json());
 app.get('/api/dashboard', (_req, res) => res.json(dashboard()));
 app.get('/api/voyages', (_req, res) => res.json(voyages));
@@ -12,6 +12,25 @@ app.get('/api/yard/heatmap', (_req, res) => res.json(yardHeatmap()));
 app.get('/api/yard/blocks', (_req, res) => res.json(blocks));
 app.get('/api/gate/appointments', (_req, res) => res.json(appointments));
 app.get('/api/gate/conflicts', (_req, res) => res.json(gateConflicts()));
+app.post('/api/gate/appointments/:id/adjust-preview', (req, res) => {
+  try { res.json(previewAppointmentAdjustment(req.params.id, { windowStart: req.body.windowStart, windowEnd: req.body.windowEnd, lane: req.body.lane })); }
+  catch (error) {
+    if (error instanceof GateAdjustmentError) return res.status(error.code === 'appointment-missing' ? 404 : 409).json({ message: error.message, code: error.code });
+    res.status(400).json({ message: '调整预览参数无效' });
+  }
+});
+app.post('/api/gate/appointments/:id/resolve-conflict', (req, res) => {
+  try {
+    const result = resolveGateConflict(req.params.id, typeof req.body.expectedConflictId === 'string' ? req.body.expectedConflictId : undefined, { windowStart: req.body.windowStart, windowEnd: req.body.windowEnd, lane: req.body.lane });
+    res.json(result);
+  } catch (error) {
+    if (error instanceof GateAdjustmentError) {
+      const status = error.code === 'appointment-missing' ? 404 : 409;
+      return res.status(status).json({ message: error.message, code: error.code });
+    }
+    res.status(409).json({ message: error instanceof Error ? error.message : '冲突处理失败' });
+  }
+});
 app.post('/api/gate/appointments', (req, res) => { try { res.status(201).json(createGateAppointment(req.body)); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '预约失败' }); } });
 app.patch('/api/gate/appointments/:id', (req, res) => { try { const result = editGateAppointment(req.params.id, req.body); if (!result) return res.status(404).json({ message: '预约不存在' }); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '更新预约失败' }); } });
 app.delete('/api/gate/appointments/:id', (req, res) => { const result = deleteGateAppointment(req.params.id); if (!result) return res.status(404).json({ message: '预约不存在' }); res.json({ deleted: true, id: result.id }); });

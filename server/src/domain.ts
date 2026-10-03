@@ -9,6 +9,21 @@ export interface YardBlock { id: string; zone: string; rows: number; tiers: numb
 export interface GateAppointment { id: string; containerId: string; truckNo: string; driver: string; type: 'pickup' | 'dropoff'; windowStart: string; windowEnd: string; lane: 'north' | 'south' | 'rail'; status: AppointmentStatus; sealVerified: boolean; weightVerified: boolean; exception?: string; }
 export interface Equipment { id: string; name: string; kind: EquipmentKind; status: 'available' | 'working' | 'maintenance' | 'offline'; location: string; battery: number; queue: number; movesPerHour: number; }
 export interface YardTask { id: string; kind: 'receive' | 'deliver' | 'rehandle' | 'load' | 'discharge' | 'inspect'; containerId: string; from: string; to: string; equipmentId?: string; priority: number; status: TaskStatus; scheduledAt: string; blockingReasons: string[]; estimatedMinutes: number; }
+export interface ConflictParty { appointmentId: string; containerId: string; truckNo: string; type: GateAppointment['type']; windowStart: string; windowEnd: string; lane: GateAppointment['lane']; status: AppointmentStatus; }
+export type GateConflictKind = 'truck-overlap' | 'lane-overlap' | 'customs-blocked';
+export interface GateConflict {
+  id: string;
+  kind: GateConflictKind;
+  severity: 'critical' | 'warning';
+  appointmentId: string;
+  otherAppointmentId?: string;
+  lane?: GateAppointment['lane'];
+  truckNo?: string;
+  customs?: Container['customs'];
+  reason: string;
+  primary: ConflictParty;
+  other?: ConflictParty;
+}
 export interface AuditEvent { id: string; actor: string; action: string; entity: string; entityId: string; at: string; details: string; }
 
 const start = Date.now(); const iso = (minutes: number) => new Date(start + minutes * 60000).toISOString();
@@ -36,7 +51,8 @@ export const appointments: GateAppointment[] = [
   { id: 'APT-9001', containerId: 'OOLU-7734201', truckNo: '沪A·7K229', driver: '陈海', type: 'dropoff', windowStart: iso(-14), windowEnd: iso(16), lane: 'south', status: 'checked-in', sealVerified: true, weightVerified: true },
   { id: 'APT-9002', containerId: 'MSCU-4829017', truckNo: '苏E·66218', driver: '王建国', type: 'pickup', windowStart: iso(34), windowEnd: iso(64), lane: 'north', status: 'booked', sealVerified: false, weightVerified: false },
   { id: 'APT-9003', containerId: 'EISU-1288420', truckNo: '沪B·02891', driver: '赵晨', type: 'pickup', windowStart: iso(38), windowEnd: iso(68), lane: 'north', status: 'booked', sealVerified: false, weightVerified: false },
-  { id: 'APT-9004', containerId: 'FCIU-9920310', truckNo: '沪A·7K229', driver: '陈海', type: 'pickup', windowStart: iso(4), windowEnd: iso(22), lane: 'south', status: 'booked', sealVerified: false, weightVerified: false, exception: '同一车辆相邻窗口过短' }
+  { id: 'APT-9004', containerId: 'FCIU-9920310', truckNo: '沪A·7K229', driver: '陈海', type: 'pickup', windowStart: iso(4), windowEnd: iso(22), lane: 'south', status: 'booked', sealVerified: false, weightVerified: false, exception: '同一车辆相邻窗口过短' },
+  { id: 'APT-9005', containerId: 'TGHU-9831204', truckNo: '浙B·91D07', driver: '孙立', type: 'pickup', windowStart: iso(30), windowEnd: iso(60), lane: 'rail', status: 'booked', sealVerified: false, weightVerified: false, exception: '海关查验挂起，提箱预约暂不生效' }
 ];
 export const equipment: Equipment[] = [
   { id: 'QC-07', name: '岸桥 QC-07', kind: 'quay-crane', status: 'working', location: 'B07 / MSC Aurora', battery: 96, queue: 4, movesPerHour: 31 },
@@ -59,14 +75,167 @@ export function dashboard() {
   const yardCapacity = blocks.reduce((sum, block) => sum + block.capacity, 0); const yardOccupied = blocks.reduce((sum, block) => sum + block.occupied, 0);
   return { activeVoyages: activeVoyages.length, berthMoves: activeVoyages.reduce((sum, v) => sum + v.movesPlanned - v.movesDone, 0), yardUtilization: yardOccupied / yardCapacity, gateQueue: appointments.filter(a => a.status === 'checked-in').length + 7, pendingTasks: tasks.filter(t => t.status !== 'done').length, blockedTasks: tasks.filter(t => t.status === 'blocked').length, reeferAlerts: containers.filter(c => c.reefer && (c.customs === 'inspection' || (c.temperature ?? 0) > 5)).length, hazmatHolds: containers.filter(c => c.hazmatClass && c.customs !== 'released').length, lateVessels: activeVoyages.filter(v => v.lateRisk === 'high').length };
 }
-export function gateConflicts() {
-  const result: { severity: 'critical' | 'warning'; appointmentId: string; reason: string }[] = [];
-  appointments.forEach((a, index) => appointments.slice(index + 1).forEach(b => {
-    const overlap = a.truckNo === b.truckNo && new Date(a.windowStart).getTime() < new Date(b.windowEnd).getTime() && new Date(b.windowStart).getTime() < new Date(a.windowEnd).getTime();
-    if (overlap) result.push({ severity: 'critical', appointmentId: a.id, reason: `车辆 ${a.truckNo} 与 ${b.id} 时间窗口重叠，需重新分配闸口时隙` });
+export class GateAdjustmentError extends Error {
+  constructor(public code: 'invalid-window' | 'customs-hold' | 'appointment-missing' | 'conflict-changed', message: string) { super(message); }
+}
+
+const laneNames: Record<GateAppointment['lane'], string> = { north: '北闸口', south: '南闸口', rail: '铁路闸口' };
+export const customsLabel: Record<Container['customs'], string> = { released: '已放行', inspection: '查验中', hold: '海关扣留' };
+export const laneLabel = (lane: GateAppointment['lane']) => laneNames[lane];
+
+const overlaps = (a: { windowStart: string; windowEnd: string }, b: { windowStart: string; windowEnd: string }) =>
+  new Date(a.windowStart).getTime() < new Date(b.windowEnd).getTime() && new Date(b.windowStart).getTime() < new Date(a.windowEnd).getTime();
+
+type InternalConflict =
+  | { kind: 'truck-overlap'; severity: 'critical'; pair: [GateAppointment, GateAppointment] }
+  | { kind: 'lane-overlap'; severity: 'warning'; pair: [GateAppointment, GateAppointment] }
+  | { kind: 'customs-blocked'; severity: 'warning'; appointment: GateAppointment; container: Container };
+
+function detectConflicts(list: GateAppointment[]): InternalConflict[] {
+  const result: InternalConflict[] = [];
+  list.forEach((a, index) => list.slice(index + 1).forEach(b => {
+    if (a.status === 'cancelled' || b.status === 'cancelled') return;
+    if (overlaps(a, b)) {
+      if (a.truckNo === b.truckNo) {
+        result.push({ kind: 'truck-overlap', severity: 'critical', pair: [a, b] });
+      } else if (a.lane === b.lane) {
+        result.push({ kind: 'lane-overlap', severity: 'warning', pair: [a, b] });
+      }
+    }
   }));
-  appointments.filter(a => a.status === 'booked').forEach(a => { const container = containers.find(c => c.id === a.containerId); if (container?.customs !== 'released') result.push({ severity: 'warning', appointmentId: a.id, reason: `箱 ${a.containerId} 海关状态为 ${container?.customs}，无法无条件放行` }); });
+  list.filter(a => a.status === 'booked' && a.type === 'pickup').forEach(a => {
+    const container = containers.find(c => c.id === a.containerId);
+    if (container && container.customs !== 'released') result.push({ kind: 'customs-blocked', severity: 'warning', appointment: a, container });
+  });
   return result;
+}
+
+function conflictRank(appointment: GateAppointment) { return appointment.status === 'booked' ? 0 : 1; }
+function toParty(a: GateAppointment): ConflictParty {
+  return { appointmentId: a.id, containerId: a.containerId, truckNo: a.truckNo, type: a.type, windowStart: a.windowStart, windowEnd: a.windowEnd, lane: a.lane, status: a.status };
+}
+function pairId(kind: 'truck-overlap' | 'lane-overlap', a: GateAppointment, b: GateAppointment) {
+  const [first, second] = [a.id, b.id].sort();
+  return `${kind}:${first}|${second}`;
+}
+function toGateConflict(entry: InternalConflict): GateConflict {
+  if (entry.kind === 'customs-blocked') {
+    const { appointment, container } = entry;
+    return {
+      id: `customs-blocked:${appointment.id}`, kind: 'customs-blocked', severity: 'warning', appointmentId: appointment.id,
+      customs: container.customs, reason: `提箱箱 ${container.id} 海关${customsLabel[container.customs]}，未放行前任何时隙都不能进闸提箱；改时隙无法解决，须等待海关放行或改办进场`,
+      primary: toParty(appointment)
+    };
+  }
+  const [rawA, rawB] = entry.pair;
+  const [primary, other] = conflictRank(rawA) <= conflictRank(rawB) ? [rawA, rawB] : [rawB, rawA];
+  if (entry.kind === 'truck-overlap') {
+    return {
+      id: pairId('truck-overlap', rawA, rawB), kind: 'truck-overlap', severity: 'critical', appointmentId: primary.id, otherAppointmentId: other.id,
+      truckNo: primary.truckNo, reason: `车辆 ${primary.truckNo} 的两条预约时间窗口重叠（${primary.id} 与 ${other.id}），同一车辆无法同时过闸，需错开时隙`,
+      primary: toParty(primary), other: toParty(other)
+    };
+  }
+  return {
+    id: pairId('lane-overlap', rawA, rawB), kind: 'lane-overlap', severity: 'warning', appointmentId: primary.id, otherAppointmentId: other.id,
+    lane: primary.lane, reason: `${laneNames[primary.lane]} 在 ${primary.id} 与 ${other.id} 的重叠窗口内车道占用冲突，可调换空闲车道或错开时隙`,
+    primary: toParty(primary), other: toParty(other)
+  };
+}
+
+export function gateConflicts(): GateConflict[] {
+  const order: Record<GateConflictKind, number> = { 'truck-overlap': 0, 'lane-overlap': 1, 'customs-blocked': 2 };
+  return detectConflicts(appointments).map(toGateConflict).sort((a, b) => order[a.kind] - order[b.kind] || a.appointmentId.localeCompare(b.appointmentId));
+}
+
+export interface AppointmentAdjustmentQuery {
+  windowStart?: string;
+  windowEnd?: string;
+  lane?: GateAppointment['lane'];
+}
+export interface AppointmentAdjustmentPreview {
+  target: ConflictParty;
+  targetContainer?: { id: string; customs: Container['customs']; customsLabel: string };
+  affected?: ConflictParty;
+  affectedContainer?: { id: string; customs: Container['customs']; customsLabel: string };
+  requested: AppointmentAdjustmentQuery;
+  conflictKind?: GateConflictKind;
+  beforeConflicts: GateConflict[];
+  afterConflicts: GateConflict[];
+  newConflicts: GateConflict[];
+  remainingConflictIds: string[];
+  resolvesConflict: boolean;
+  customsBlocked: boolean;
+  notes: string[];
+}
+
+function buildPreview(target: GateAppointment, query: AppointmentAdjustmentQuery): AppointmentAdjustmentPreview {
+  const windowStart = query.windowStart ?? target.windowStart;
+  const windowEnd = query.windowEnd ?? target.windowEnd;
+  if (new Date(windowEnd) <= new Date(windowStart)) throw new GateAdjustmentError('invalid-window', '预约结束时间必须晚于开始时间');
+  const simulated: GateAppointment = { ...target, windowStart, windowEnd, lane: query.lane ?? target.lane };
+  const targetContainer = containers.find(c => c.id === target.containerId);
+  const customsBlocked = target.type === 'pickup' && targetContainer !== undefined && targetContainer.customs !== 'released';
+  const before = detectConflicts(appointments).map(toGateConflict);
+  const after = detectConflicts(appointments.map(a => a.id === target.id ? simulated : a)).map(toGateConflict);
+  const targetConflicts = before.filter(c => c.appointmentId === target.id || c.otherAppointmentId === target.id);
+  const targetConflict = targetConflicts.find(c => c.kind !== 'customs-blocked');
+  const otherId = targetConflict?.otherAppointmentId;
+  const affected = otherId ? appointments.find(a => a.id === otherId) : undefined;
+  const afterIds = new Set(after.map(c => c.id));
+  const remainingConflictIds = targetConflicts.filter(c => afterIds.has(c.id)).map(c => c.id);
+  const newConflicts = after.filter(c => !before.some(b => b.id === c.id) && (c.appointmentId === target.id || c.otherAppointmentId === target.id));
+  const notes: string[] = [];
+  if (customsBlocked) notes.push(`该预约为提箱且箱 ${targetContainer?.id} 海关${customsLabel[targetContainer!.customs]}，调整车道/时隙均无法解除，必须等待海关放行或联系海关查验台`);
+  if (!customsBlocked && targetConflicts.some(c => c.kind === 'truck-overlap')) notes.push('同一车辆的时间重叠只能通过错开时隙解决，调换车道无效');
+  if (!customsBlocked && targetConflict?.kind === 'lane-overlap') notes.push('车道占用冲突可调换到其他车道，或把窗口前后错开');
+  if (!customsBlocked && newConflicts.length) notes.push('新窗口会与其他预约产生冲突，请继续调整');
+  if (!customsBlocked && !newConflicts.length && remainingConflictIds.length === 0 && targetConflicts.length > 0) notes.push('当前方案可解除该冲突，确认后保存并写入审计');
+  if (!customsBlocked && targetConflicts.length === 0 && newConflicts.length === 0) notes.push('该预约当前没有冲突，调整后也不会引入新冲突');
+  return {
+    target: toParty(simulated),
+    targetContainer: targetContainer ? { id: targetContainer.id, customs: targetContainer.customs, customsLabel: customsLabel[targetContainer.customs] } : undefined,
+    affected: affected ? toParty(affected) : undefined,
+    affectedContainer: affected ? (() => { const c = containers.find(item => item.id === affected.containerId); return c ? { id: c.id, customs: c.customs, customsLabel: customsLabel[c.customs] } : undefined; })() : undefined,
+    requested: { windowStart, windowEnd, lane: simulated.lane },
+    conflictKind: targetConflict?.kind,
+    beforeConflicts: before,
+    afterConflicts: after,
+    newConflicts,
+    remainingConflictIds,
+    resolvesConflict: !customsBlocked && targetConflicts.filter(c => c.kind !== 'customs-blocked').length > 0 && remainingConflictIds.length === 0 && newConflicts.length === 0,
+    customsBlocked,
+    notes
+  };
+}
+
+export function previewAppointmentAdjustment(id: string, query: AppointmentAdjustmentQuery): AppointmentAdjustmentPreview {
+  const target = appointments.find(a => a.id === id);
+  if (!target) throw new GateAdjustmentError('appointment-missing', '预约不存在或已被删除');
+  return buildPreview(target, query);
+}
+
+export function resolveGateConflict(id: string, expectedConflictId: string | undefined, patch: AppointmentAdjustmentQuery): { appointment: GateAppointment; preview: AppointmentAdjustmentPreview } {
+  const target = appointments.find(a => a.id === id);
+  if (!target) throw new GateAdjustmentError('appointment-missing', '预约不存在或已被删除');
+  const targetContainer = containers.find(c => c.id === target.containerId);
+  const reschedules = (patch.windowStart !== undefined && patch.windowStart !== target.windowStart)
+    || (patch.windowEnd !== undefined && patch.windowEnd !== target.windowEnd)
+    || (patch.lane !== undefined && patch.lane !== target.lane);
+  if (reschedules && target.type === 'pickup' && targetContainer && targetContainer.customs !== 'released') {
+    throw new GateAdjustmentError('customs-hold', `箱 ${targetContainer.id} 海关${customsLabel[targetContainer.customs]}，未放行提箱不能通过改时隙/车道处理；请等待放行后重试`);
+  }
+  const preview = buildPreview(target, patch);
+  const currentIds = new Set(preview.beforeConflicts.map(c => c.id));
+  if (expectedConflictId && !currentIds.has(expectedConflictId)) {
+    throw new GateAdjustmentError('conflict-changed', '该冲突刚已被其他值班员处理或预约发生变化，已为你重新读取最新数据，请按最新冲突列表继续操作');
+  }
+  const windowStart = patch.windowStart ?? target.windowStart;
+  const windowEnd = patch.windowEnd ?? target.windowEnd;
+  const lane = patch.lane ?? target.lane;
+  Object.assign(target, { windowStart, windowEnd, lane });
+  recordAudit('RESOLVE_CONFLICT', 'appointment', id, `冲突 ${expectedConflictId ?? 'n/a'} 调整：${JSON.stringify(patch)}；剩余冲突 ${preview.afterConflicts.length} 条`);
+  return { appointment: target, preview: buildPreview(target, {}) };
 }
 export function yardHeatmap() { return blocks.map(block => ({ ...block, utilization: block.occupied / block.capacity, freeSlots: block.capacity - block.occupied, pressure: block.heat > 85 ? 'critical' : block.heat > 65 ? 'warning' : 'normal' })); }
 export function containerPlan(containerId: string) {

@@ -1,10 +1,15 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 type Dashboard = { activeVoyages: number; berthMoves: number; yardUtilization: number; gateQueue: number; pendingTasks: number; blockedTasks: number; reeferAlerts: number; hazmatHolds: number; lateVessels: number };
 type Voyage = { id: string; vessel: string; service: string; eta: string; etd: string; status: string; berth: string; movesPlanned: number; movesDone: number; lateRisk: string };
 type Container = { id: string; voyageId: string; size: '20'|'40'|'45'; isoType: string; direction: 'import'|'export'|'transshipment'; status: string; weightT: number; reefer: boolean; temperature?: number; hazmatClass?: string; customs: 'released'|'inspection'|'hold'; priority: string; yardSlot: string; appointmentId?: string; lastEvent: string };
 type Block = { id: string; zone: string; capacity: number; occupied: number; reeferPlugs: number; usedPlugs: number; hazmatAllowed: boolean; heat: number; utilization: number; freeSlots: number; pressure: string };
-type Conflict = { severity: string; appointmentId: string; reason: string };
+type ConflictParty = { appointmentId: string; containerId: string; truckNo: string; type: 'pickup'|'dropoff'; windowStart: string; windowEnd: string; lane: 'north'|'south'|'rail'; status: string };
+type ConflictKind = 'truck-overlap'|'lane-overlap'|'customs-blocked';
+type Conflict = { id: string; kind: ConflictKind; severity: string; appointmentId: string; otherAppointmentId?: string; lane?: 'north'|'south'|'rail'; truckNo?: string; customs?: 'released'|'inspection'|'hold'; reason: string; primary: ConflictParty; other?: ConflictParty };
+type AdjustPreviewPartyContainer = { id: string; customs: 'released'|'inspection'|'hold'; customsLabel: string };
+type AdjustPreview = { target: ConflictParty; targetContainer?: AdjustPreviewPartyContainer; affected?: ConflictParty; affectedContainer?: AdjustPreviewPartyContainer; requested: { windowStart?: string; windowEnd?: string; lane?: 'north'|'south'|'rail' }; conflictKind?: ConflictKind; beforeConflicts: Conflict[]; afterConflicts: Conflict[]; newConflicts: Conflict[]; remainingConflictIds: string[]; resolvesConflict: boolean; customsBlocked: boolean; notes: string[] };
+type AdjustState = { conflict: Conflict; windowStart: string; windowEnd: string; lane: 'north'|'south'|'rail'; preview?: AdjustPreview; loading: boolean; saving: boolean; notice: string; error: string };
 type Appointment = { id: string; containerId: string; truckNo: string; driver: string; type: 'pickup'|'dropoff'; windowStart: string; windowEnd: string; lane: 'north'|'south'|'rail'; status: string; exception?: string };
 type Task = { id: string; kind: string; containerId: string; from: string; to: string; equipmentId?: string; priority: number; score: number; status: string; blockingReasons: string[]; estimatedMinutes: number; scheduledAt: string };
 type Equipment = { id: string; name: string; kind: string; status: string; location: string; battery: number; queue: number; movesPerHour: number };
@@ -12,6 +17,10 @@ type Section = 'control'|'containers'|'gate'|'yard'|'tasks';
 type Editor = { entity: 'container'|'appointment'|'task'; mode: 'create'|'edit'; id?: string; values: Record<string, string|boolean> };
 
 const api = '/api';
+const laneNames: Record<'north'|'south'|'rail', string> = { north: '北闸口', south: '南闸口', rail: '铁路闸口' };
+const typeNames: Record<'pickup'|'dropoff', string> = { pickup: '提箱', dropoff: '进场' };
+const customsBadge: Record<'released'|'inspection'|'hold', string> = { released: '海关已放行', inspection: '海关查验中', hold: '海关扣留' };
+class ApiError extends Error { constructor(public code?: string) { super(); } }
 const pct = (value: number) => `${Math.round(value * 100)}%`;
 const time = (value: string) => new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const toLocalInput = (value?: string) => {
@@ -27,8 +36,18 @@ const defaultValues = (entity: Editor['entity']): Record<string, string|boolean>
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${api}${path}`, { ...init, headers: { ...(init?.body ? { 'Content-Type': 'application/json' } : {}), ...init?.headers } });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.message || `请求失败 (${response.status})`);
+  if (!response.ok) { const error = new ApiError(body.code); error.message = body.message || `请求失败 (${response.status})`; throw error; }
   return body as T;
+}
+
+function AppointmentChip({ party, container, target, adjusted }: { party: ConflictParty; container?: Container; target?: boolean; adjusted?: boolean }) {
+  const customs = container?.customs;
+  return <div className={`appt-chip${target ? ' target' : ''}${adjusted ? ' adjusted' : ''}`}>
+    <div className="appt-chip-head"><b>{party.appointmentId}</b>{target && <span className="chip-flag">调整对象</span>}{adjusted && <span className="chip-flag ghost">调整后</span>}</div>
+    <span className="appt-chip-line">{typeNames[party.type]} · 箱 {party.containerId}{customs && customs !== 'released' ? ` · ${customsBadge[customs]}` : ''}</span>
+    <span className="appt-chip-line">{party.truckNo} · {laneNames[party.lane]}</span>
+    <span className="appt-chip-line">{time(party.windowStart)}—{time(party.windowEnd)} · {party.status}</span>
+  </div>;
 }
 
 export default function App() {
@@ -46,6 +65,10 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [adjust, setAdjust] = useState<AdjustState>();
+  const [highlightId, setHighlightId] = useState('');
+  const [customsRefreshing, setCustomsRefreshing] = useState('');
+  const previewSeq = useRef(0);
 
   const load = useCallback(async () => {
     const [d, v, ctn, b, cf, a, t, e] = await Promise.all([
@@ -93,6 +116,93 @@ export default function App() {
   };
   const updateAppointmentStatus = async (id: string, status: string) => mutate(`/gate/appointments/${id}`, 'PATCH', { status });
   const assign = async (id: string, equipmentId: string) => equipmentId ? mutate(`/tasks/${id}/assign`, 'PATCH', { equipmentId }) : mutate(`/tasks/${id}`, 'PATCH', { equipmentId: '', status: 'queued' });
+
+  const locateAppointment = (id: string) => {
+    setTab('gate');
+    requestAnimationFrame(() => document.getElementById(`appointment-row-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' }));
+    setHighlightId(id);
+    window.setTimeout(() => setHighlightId(current => current === id ? '' : current), 4000);
+  };
+  const refreshPreview = useCallback(async (conflict: Conflict, windowStart: string, windowEnd: string, lane: 'north'|'south'|'rail') => {
+    const seq = ++previewSeq.current;
+    setAdjust(current => current ? { ...current, loading: true, error: '', notice: '' } : current);
+    try {
+      const preview = await request<AdjustPreview>(`/gate/appointments/${conflict.appointmentId}/adjust-preview`, {
+        method: 'POST', body: JSON.stringify({ windowStart: new Date(windowStart).toISOString(), windowEnd: new Date(windowEnd).toISOString(), lane })
+      });
+      if (seq !== previewSeq.current) return;
+      setAdjust(current => current ? { ...current, preview, loading: false } : current);
+    } catch (reason) {
+      if (seq !== previewSeq.current) return;
+      setAdjust(current => current ? { ...current, loading: false, error: reason instanceof Error ? reason.message : '冲突预览失败' } : current);
+    }
+  }, []);
+  const openConflictAdjust = (conflict: Conflict) => {
+    const target = appointments.find(item => item.id === conflict.appointmentId);
+    if (!target) return;
+    setError('');
+    const draft: AdjustState = { conflict, windowStart: toLocalInput(target.windowStart), windowEnd: toLocalInput(target.windowEnd), lane: target.lane, loading: true, saving: false, notice: '', error: '' };
+    setAdjust(draft);
+    void refreshPreview(conflict, draft.windowStart, draft.windowEnd, draft.lane);
+  };
+  const closeAdjust = () => { previewSeq.current++; setAdjust(undefined); };
+  const shiftWindow = (minutes: number) => {
+    if (!adjust) return;
+    const windowStart = new Date(new Date(adjust.windowStart).getTime() + minutes * 60000);
+    const windowEnd = new Date(new Date(adjust.windowEnd).getTime() + minutes * 60000);
+    const next = { ...adjust, windowStart: toLocalInput(windowStart.toISOString()), windowEnd: toLocalInput(windowEnd.toISOString()) };
+    setAdjust(next);
+    void refreshPreview(next.conflict, next.windowStart, next.windowEnd, next.lane);
+  };
+  const changeAdjustField = (patch: Partial<Pick<AdjustState, 'windowStart'|'windowEnd'|'lane'>>) => {
+    setAdjust(current => {
+      if (!current) return current;
+      const next = { ...current, ...patch };
+      void refreshPreview(next.conflict, next.windowStart, next.windowEnd, next.lane);
+      return next;
+    });
+  };
+  const saveConflictAdjust = async () => {
+    if (!adjust) return;
+    setAdjust(current => current ? { ...current, saving: true, error: '', notice: '' } : current);
+    try {
+      const result = await request<{ preview: AdjustPreview }>(`/gate/appointments/${adjust.conflict.appointmentId}/resolve-conflict`, {
+        method: 'POST',
+        body: JSON.stringify({ expectedConflictId: adjust.conflict.id, windowStart: new Date(adjust.windowStart).toISOString(), windowEnd: new Date(adjust.windowEnd).toISOString(), lane: adjust.lane })
+      });
+      await load();
+      const remaining = result.preview.afterConflicts.length;
+      setAdjust(undefined);
+      setMessage(remaining ? `预约 ${adjust.conflict.appointmentId} 已调整，该冲突已解除；当前还剩 ${remaining} 条其他冲突，可在列表中继续处理` : '冲突已解除，闸口冲突列表与预约数据已刷新');
+    } catch (reason) {
+      await load().catch(() => undefined);
+      const code = reason instanceof ApiError ? reason.code : undefined;
+      const detail = reason instanceof Error ? reason.message : '保存失败';
+      if (code === 'conflict-changed') {
+        setAdjust(undefined);
+        setError(`${detail}。可在刷新后的冲突列表中重新选择处理；如冲突已消失，无需重复操作。`);
+      } else if (code === 'customs-hold') {
+        setAdjust(undefined);
+        setError(`${detail}。该提箱预约不能改时隙，请等待海关放行后在冲突卡片上重新检测，或联系海关查验台。`);
+      } else if (code === 'appointment-missing') {
+        setAdjust(undefined);
+        setError('目标预约可能已被其他值班员取消或删除，数据已重新读取；请按最新预约列表继续操作。');
+      } else {
+        setAdjust(current => current ? { ...current, saving: false, error: `${detail}。表单未关闭，可重试；如多次失败请刷新冲突数据后再处理。` } : current);
+      }
+    }
+  };
+  const recheckCustoms = async (conflict: Conflict) => {
+    setCustomsRefreshing(conflict.appointmentId);
+    setError('');
+    try {
+      const [latest] = await Promise.all([request<Conflict[]>('/gate/conflicts'), load()]);
+      const gone = !latest.some(item => item.id === conflict.id);
+      setMessage(gone ? `箱 ${conflict.primary.containerId} 已海关放行，该冲突已解除` : '已重新读取最新数据：该箱仍未海关放行，请等待放行后再处理');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '重新读取数据失败，请稍后重试');
+    } finally { setCustomsRefreshing(''); }
+  };
   const selected = voyages.find(voyage => voyage.id === selectedVoyage);
   const remaining = selected ? selected.movesPlanned - selected.movesDone : 0;
   const maxHeat = useMemo(() => Math.max(...blocks.map(block => block.heat), 1), [blocks]);
@@ -107,7 +217,28 @@ export default function App() {
     <nav className="tabs"><button className={tab==='control'?'active':''} onClick={() => setTab('control')}>作业驾驶舱</button><button className={tab==='containers'?'active':''} onClick={() => setTab('containers')}>箱务台账 / CRUD</button><button className={tab==='gate'?'active':''} onClick={() => setTab('gate')}>闸口预约</button><button className={tab==='yard'?'active':''} onClick={() => setTab('yard')}>堆场热区</button><button className={tab==='tasks'?'active':''} onClick={() => setTab('tasks')}>设备任务</button><span>最后同步 {new Date().toLocaleTimeString()}</span></nav>
     {tab === 'control' && <div className="layout"><section className="panel vessel-panel"><div className="panel-head"><div><div className="eyebrow">VESSEL WINDOW / 船期窗口</div><h2>泊位作业进度</h2></div><span className="muted">剩余作业动态计算</span></div>{voyages.map(voyage => <button key={voyage.id} className={`vessel ${selectedVoyage===voyage.id?'selected':''}`} onClick={() => setSelectedVoyage(voyage.id)}><span className={`vessel-dot ${voyage.status}`}/><span className="vessel-main"><b>{voyage.vessel}</b><small>{voyage.id} · {voyage.service} · {voyage.berth}</small><i><em style={{ width: `${Math.min(100, voyage.movesDone / voyage.movesPlanned * 100)}%` }}/></i></span><span className="vessel-move"><b>{voyage.movesDone.toLocaleString()}</b><small>/ {voyage.movesPlanned.toLocaleString()} moves</small></span><strong className={voyage.lateRisk}>{voyage.lateRisk==='high'?'HIGH':voyage.lateRisk==='medium'?'WATCH':'ON TIME'}</strong></button>)}</section><section className="panel focus-panel"><div className="panel-head"><div><div className="eyebrow">SELECTED VOYAGE / {selected?.id}</div><h2>{selected?.vessel}</h2></div><span className={`badge ${selected?.lateRisk}`}>{selected?.status}</span></div><div className="voyage-stats"><div><small>ETA</small><b>{selected&&time(selected.eta)}</b><span>预计靠泊</span></div><div><small>ETD</small><b>{selected&&time(selected.etd)}</b><span>计划离港</span></div><div><small>REMAINING</small><b>{remaining}</b><span>剩余翻箱</span></div></div><div className="berth-map"><div className="water"><span>岸线 / BERTH</span><i className="ship" style={{ left: `${selected?.berth==='B07'?50:24}%` }}>{selected?.vessel}</i><b>B01</b><b>B04</b><b>B07</b><b>B10</b></div></div><div className="callout"><strong>调度策略</strong><span>已把 {dashboard.blockedTasks} 个阻塞任务、{dashboard.gateQueue} 车闸口压力纳入当前窗口；优先保护冷藏与危险品安全约束。</span></div></section><section className="panel wide"><div className="panel-head"><h3>异常与联动信号</h3><span>{conflicts.length} gate conflicts detected</span></div><div className="signal-grid"><div><strong className="critical">{dashboard.blockedTasks}</strong><span>设备/约束阻塞</span><small>最高优先级：海关查验任务</small></div><div><strong className="warning">{conflicts.length}</strong><span>闸口预约冲突</span><small>同车重叠窗口需人工重排</small></div><div><strong className="warning">{dashboard.reeferAlerts}</strong><span>冷藏与温控风险</span><small>查验区电源余量接近阈值</small></div><div><strong className="ok">{equipment.filter(item => item.status==='available').length}</strong><span>可调度设备</span><small>场桥 / 正面吊 / 集卡</small></div></div></section></div>}
     {tab === 'containers' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">CONTAINER REGISTER / CRUD</div><h2>箱务台账</h2><span className="muted">新增、查询、编辑、删除；危险品与冷藏箱受堆场约束校验</span></div><button className="primary-action" onClick={() => openCreate('container')}>＋ 新增箱务</button></div><div className="table container-table"><div className="tr th"><span>箱号 / 航次</span><span>尺寸 / 流向</span><span>箱况 / 海关</span><span>堆位</span><span>重量 / 属性</span><span>操作</span></div>{containers.map(container => <div className="tr" key={container.id}><span><b>{container.id}</b><small>{container.voyageId} · {container.lastEvent}</small></span><span>{container.size}ft · {container.direction}<small>{container.isoType}</small></span><span><b>{container.status}</b><small>海关：{container.customs}</small></span><span>{container.yardSlot}</span><span>{container.weightT}t<small>{container.reefer?`冷藏 ${container.temperature}°C`:container.hazmatClass?`危险品 ${container.hazmatClass} 类`:'普通箱'}</small></span><span className="row-actions"><button onClick={() => openEdit('container', container.id, { ...container, weightT: String(container.weightT), temperature: String(container.temperature ?? 4), hazmatClass: container.hazmatClass ?? '' })}>编辑</button><button className="danger-action" onClick={() => void remove('container', container.id)}>删除</button></span></div>)}</div></section>}
-    {tab === 'gate' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">GATE APPOINTMENT / SLOT CONTROL</div><h2>闸口预约与车道状态</h2><span className="muted">支持新增预约、编辑时隙、签到/完成和删除</span></div><button className="primary-action" onClick={() => openCreate('appointment')}>＋ 新增预约</button></div>{conflicts.map(conflict => <div className="conflict" key={`${conflict.appointmentId}-${conflict.reason}`}><strong>{conflict.severity}</strong><b>{conflict.appointmentId}</b><span>{conflict.reason}</span></div>)}<div className="table"><div className="tr th"><span>预约</span><span>箱号 / 车辆</span><span>窗口</span><span>车道</span><span>状态</span><span>操作</span></div>{appointments.map(appointment => <div className="tr" key={appointment.id}><span><b>{appointment.id}</b><small>{appointment.type}</small></span><span><b>{appointment.containerId}</b><small>{appointment.truckNo} · {appointment.driver}</small></span><span>{time(appointment.windowStart)}—{time(appointment.windowEnd)}</span><span>{appointment.lane}</span><span className={`pill ${appointment.status}`}>{appointment.status}</span><span className="row-actions">{appointment.status==='booked'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'checked-in')}>签到</button>:appointment.status==='checked-in'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'completed')}>完成</button>:null}<button onClick={() => openEdit('appointment', appointment.id, { ...appointment, windowStart: toLocalInput(appointment.windowStart), windowEnd: toLocalInput(appointment.windowEnd) })}>编辑</button><button className="danger-action" onClick={() => void remove('appointment', appointment.id)}>删除</button></span></div>)}</div></section>}
+    {tab === 'gate' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">GATE APPOINTMENT / SLOT CONTROL</div><h2>闸口预约与车道状态</h2><span className="muted">支持新增预约、编辑时隙、签到/完成和删除</span></div><button className="primary-action" onClick={() => openCreate('appointment')}>＋ 新增预约</button></div><div className="conflict-list-head"><div><div className="eyebrow">CONFLICT QUEUE / 待处理冲突</div><h3>闸口冲突处置 {conflicts.length > 0 && <em>{conflicts.length} 条</em>}</h3></div>{conflicts.length > 0 && <button type="button" onClick={() => void load().then(() => setMessage('冲突数据已重新读取'))} className="ghost-action">重新读取冲突</button>}</div>
+{conflicts.length === 0 && <div className="conflict-empty">当前没有同车重叠、车道占用或海关未放行冲突</div>}
+{conflicts.map(conflict => {
+  const isCustoms = conflict.kind === 'customs-blocked';
+  const parties = isCustoms ? [conflict.primary] : [conflict.primary, conflict.other].filter(Boolean) as ConflictParty[];
+  return <div className={`conflict-card ${isCustoms ? 'customs' : conflict.severity}`} key={conflict.id}>
+    <div className="conflict-top">
+      <span className={`conflict-tag ${isCustoms ? 'tag-customs' : conflict.kind === 'truck-overlap' ? 'tag-truck' : 'tag-lane'}`}>{isCustoms ? '海关管制' : conflict.kind === 'truck-overlap' ? '同车时间重叠' : '同车道占用冲突'}</span>
+      <p>{conflict.reason}</p>
+    </div>
+    <div className="conflict-parties">
+      {parties.map(party => <AppointmentChip key={party.appointmentId} party={party} container={containers.find(c => c.id === party.containerId)} target={!isCustoms && party.appointmentId === conflict.appointmentId}/>)}
+    </div>
+    <div className="conflict-actions">
+      {!isCustoms && <button type="button" className="primary-action" onClick={() => openConflictAdjust(conflict)}>快速调整（窗口 / 车道）</button>}
+      <button type="button" className="ghost-action" onClick={() => locateAppointment(conflict.appointmentId)}>定位预约 {conflict.appointmentId}</button>
+      {isCustoms && <button type="button" className="ghost-action" disabled={customsRefreshing === conflict.appointmentId} onClick={() => void recheckCustoms(conflict)}>{customsRefreshing === conflict.appointmentId ? '读取中…' : '重新检测海关状态'}</button>}
+    </div>
+    {isCustoms && <div className="customs-note">该箱未获海关放行：提供改时隙/车道只会让车辆空跑闸口，因此此处不提供重排操作；放行后点击“重新检测海关状态”即自动解除。</div>}
+  </div>;
+})}
+<div className="table"><div className="tr th"><span>预约</span><span>箱号 / 车辆</span><span>窗口</span><span>车道</span><span>状态</span><span>操作</span></div>{appointments.map(appointment => <div className={`tr${highlightId===appointment.id?' appointment-flash':''}`} id={`appointment-row-${appointment.id}`} key={appointment.id}><span><b>{appointment.id}</b><small>{appointment.type}</small></span><span><b>{appointment.containerId}</b><small>{appointment.truckNo} · {appointment.driver}</small></span><span>{time(appointment.windowStart)}—{time(appointment.windowEnd)}</span><span>{laneNames[appointment.lane]}</span><span className={`pill ${appointment.status}`}>{appointment.status}</span><span className="row-actions">{appointment.status==='booked'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'checked-in')}>签到</button>:appointment.status==='checked-in'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'completed')}>完成</button>:null}<button onClick={() => openEdit('appointment', appointment.id, { ...appointment, windowStart: toLocalInput(appointment.windowStart), windowEnd: toLocalInput(appointment.windowEnd) })}>编辑</button><button className="danger-action" onClick={() => void remove('appointment', appointment.id)}>删除</button></span></div>)}</div></section>}
     {tab === 'yard' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">YARD HEATMAP / STACK DENSITY</div><h2>堆场容量与安全约束</h2></div><span className="muted">实时区块压力</span></div><div className="yard-grid">{blocks.map(block => <div className={`block ${block.pressure}`} key={block.id}><div className="block-top"><b>{block.id}</b><strong>{pct(block.utilization)}</strong></div><span>{block.zone}</span><div className="heat"><i style={{ width: `${block.heat / maxHeat * 100}%` }}/></div><div className="block-stats"><span>空位 {block.freeSlots}</span><span>冷插 {block.usedPlugs}/{block.reeferPlugs}</span><span>{block.hazmatAllowed?'危险品可入':'普通区'}</span></div></div>)}</div><div className="yard-note"><span>堆位推荐会同时考虑容量、热区、危险品隔离、冷藏插座和设备可达性。</span><b>A01 → C03 重排建议可释放 21 个低热度堆位</b></div></section>}
     {tab === 'tasks' && <div className="layout"><section className="panel wide"><div className="panel-head"><div><div className="eyebrow">TASK DISPATCH / EQUIPMENT POOL</div><h2>场内任务优先级与设备指派</h2><span className="muted">支持新增、编辑、删除和设备指派</span></div><button className="primary-action" onClick={() => openCreate('task')}>＋ 新建任务</button></div><div className="table task-table"><div className="tr th"><span>任务</span><span>箱号</span><span>路径</span><span>优先级</span><span>状态</span><span>设备 / 操作</span></div>{tasks.map(task => <div className="tr" key={task.id}><span><b>{task.id}</b><small>{task.kind} · {task.estimatedMinutes}min</small></span><span>{task.containerId}</span><span>{task.from} → {task.to}</span><span className={task.score>95?'critical':''}>{task.score}</span><span><span className={`pill ${task.status}`}>{task.status}</span>{task.blockingReasons.length>0&&<small className="blocked-text">{task.blockingReasons[0]}</small>}</span><span className="task-actions"><select value={task.equipmentId??''} onChange={event => void assign(task.id, event.target.value)}><option value="">未指派</option>{equipment.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button onClick={() => openEdit('task', task.id, { kind: task.kind, containerId: task.containerId, from: task.from, to: task.to, equipmentId: task.equipmentId ?? '', priority: String(task.priority), estimatedMinutes: String(task.estimatedMinutes), scheduledAt: toLocalInput(task.scheduledAt), status: task.status })}>编辑</button><button className="danger-action" onClick={() => void remove('task', task.id)}>删除</button></span></div>)}</div></section><section className="panel"><div className="panel-head"><h3>设备池</h3><span>{equipment.length} assets</span></div>{equipment.map(item => <div className="equipment" key={item.id}><i className={`equip-dot ${item.status}`}/><div><b>{item.name}</b><small>{item.location} · 队列 {item.queue}</small></div><strong>{item.battery}%</strong></div>)}</section></div>}
     <footer>HarborGrid · 内存种子数据 + REST API · 箱务台账、闸口预约、场内任务提供完整增删改查操作</footer>
@@ -144,5 +275,43 @@ export default function App() {
       </div>}
       {error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" onClick={() => setEditor(undefined)}>取消</button><button className="primary-action" disabled={busy}>{busy?'保存中…':'保存'}</button></div>
     </form></div>}
+    {adjust && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) closeAdjust(); }}>
+      <div className="editor-modal adjust-modal">
+        <div className="modal-head"><div><div className="eyebrow">CONFLICT RESOLUTION / 快速处置</div><h2>调整预约 {adjust.conflict.appointmentId}</h2></div><button type="button" className="icon-button" onClick={closeAdjust}>×</button></div>
+        <div className="adjust-parties">
+          <div><small>调整对象</small>{adjust.preview ? <AppointmentChip party={adjust.preview.target} container={containers.find(c => c.id === adjust.preview!.target.containerId)} target adjusted/> : <AppointmentChip party={adjust.conflict.primary} target/>}</div>
+          {adjust.conflict.other && <div><small>受影响的另一条预约（不会被修改，仅随新窗口重新检测）</small><AppointmentChip party={adjust.preview?.affected ?? adjust.conflict.other} container={containers.find(c => c.id === (adjust.preview?.affected ?? adjust.conflict.other!)!.containerId)}/></div>}
+          {adjust.preview?.targetContainer && adjust.preview.targetContainer.customs !== 'released' && <div className="customs-inline">箱 {adjust.preview.targetContainer.id} {adjust.preview.targetContainer.customsLabel}</div>}
+        </div>
+        <div className="form-grid">
+          <label>窗口开始<input type="datetime-local" required value={adjust.windowStart} onChange={event => changeAdjustField({ windowStart: event.target.value })}/></label>
+          <label>窗口结束<input type="datetime-local" required value={adjust.windowEnd} onChange={event => changeAdjustField({ windowEnd: event.target.value })}/></label>
+          <label>车道<select value={adjust.lane} disabled={adjust.conflict.kind === 'truck-overlap'} onChange={event => changeAdjustField({ lane: event.target.value as AdjustState['lane'] })}>{(['north','south','rail'] as const).map(lane => <option key={lane} value={lane}>{laneNames[lane]}</option>)}</select>
+            {adjust.conflict.kind === 'truck-overlap' && <small className="field-hint">同一车辆的时间重叠与车道无关，只能错开时隙</small>}
+          </label>
+          <div className="shift-buttons"><small>快速前后平移窗口</small><span>{[-60,-30,30,60].map(minutes => <button type="button" key={minutes} className="ghost-action" onClick={() => shiftWindow(minutes)}>{minutes > 0 ? `后移 ${minutes} 分` : `前移 ${-minutes} 分`}</button>)}</span></div>
+        </div>
+        <div className="adjust-preview">
+          <div className="preview-head"><small>保存前冲突预演（实时重算）</small>
+            {adjust.loading ? <span className="preview-state loading">正在重算…</span>
+              : adjust.preview?.customsBlocked ? <span className="preview-state blocked">海关未放行：改时隙不可行</span>
+              : adjust.preview?.resolvesConflict ? <span className="preview-state ok">可解除该冲突，且不引入新冲突</span>
+              : <span className="preview-state warn">冲突仍存在或会引入新冲突</span>}
+          </div>
+          {adjust.preview && <div className="preview-body">
+            <div className="preview-stat"><b>{adjust.preview.beforeConflicts.filter(c => c.appointmentId === adjust.conflict.appointmentId || c.otherAppointmentId === adjust.conflict.appointmentId).length}</b><small>该预约当前冲突</small></div>
+            <div className="preview-stat"><b>{adjust.preview.remainingConflictIds.length}</b><small>调整后仍残留</small></div>
+            <div className="preview-stat"><b>{adjust.preview.newConflicts.length}</b><small>新引入冲突</small></div>
+          </div>}
+          {adjust.preview?.newConflicts.map(item => <div className="preview-new" key={item.id}>⚠ 新冲突：{item.reason}</div>)}
+          {adjust.preview && <ul className="preview-notes">{adjust.preview.notes.map((note, index) => <li key={index}>{note}</li>)}</ul>}
+        </div>
+        {adjust.error && <div className="form-error">{adjust.error}</div>}
+        <div className="modal-actions"><button type="button" onClick={closeAdjust}>取消</button>
+          <button type="button" className="primary-action" disabled={adjust.saving || adjust.loading || !adjust.preview || !adjust.preview.resolvesConflict} title={adjust.preview && !adjust.preview.resolvesConflict ? '当前方案不能解除冲突，请继续调整窗口' : ''} onClick={() => void saveConflictAdjust()}>{adjust.saving ? '保存中…' : '保存调整并解除冲突'}</button>
+        </div>
+        {!adjust.preview?.resolvesConflict && !adjust.loading && !adjust.preview?.customsBlocked && <div className="adjust-hint">提示：保存按钮在方案确认能解除冲突后才会启用；可直接微调时间或使用前后平移按钮。</div>}
+      </div>
+    </div>}
   </main>;
 }
