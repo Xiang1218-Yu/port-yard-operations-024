@@ -1,5 +1,5 @@
 import express from 'express';
-import { appointments, assignTask, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, prioritizeTasks, tasks, updateContainer, updateYardTask, voyages, yardHeatmap } from './domain.js';
+import { appointments, assignTask, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, gateConflictsList, previewGateConflictResolution, prioritizeTasks, resolveGateConflict, tasks, updateContainer, updateYardTask, voyages, yardHeatmap, GateConflictError } from './domain.js';
 const app = express(); app.use(express.json());
 app.get('/api/dashboard', (_req, res) => res.json(dashboard()));
 app.get('/api/voyages', (_req, res) => res.json(voyages));
@@ -11,7 +11,29 @@ app.get('/api/containers/:id', (req, res) => { const result = containerDetail(re
 app.get('/api/yard/heatmap', (_req, res) => res.json(yardHeatmap()));
 app.get('/api/yard/blocks', (_req, res) => res.json(blocks));
 app.get('/api/gate/appointments', (_req, res) => res.json(appointments));
-app.get('/api/gate/conflicts', (_req, res) => res.json(gateConflicts()));
+app.get('/api/gate/conflicts', (_req, res) => res.json(gateConflictsList()));
+app.get('/api/gate/conflicts/simple', (_req, res) => res.json(gateConflicts()));
+app.post('/api/gate/conflicts/preview', (req, res) => {
+  try {
+    const { appointmentId, change, conflictId } = req.body ?? {};
+    if (!appointmentId || !change) return res.status(400).json({ message: '缺少 appointmentId 或 change' });
+    res.json(previewGateConflictResolution(appointmentId, change, conflictId));
+  } catch (error) {
+    if (error instanceof GateConflictError) return res.status(409).json({ message: error.message, code: error.code, fresh: error.fresh });
+    res.status(400).json({ message: error instanceof Error ? error.message : '冲突预检失败' });
+  }
+});
+app.post('/api/gate/conflicts/resolve', (req, res) => {
+  try {
+    const { appointmentId, change, conflictId } = req.body ?? {};
+    if (!appointmentId || !change) return res.status(400).json({ message: '缺少 appointmentId 或 change' });
+    const result = resolveGateConflict(appointmentId, change, conflictId);
+    res.json(result);
+  } catch (error) {
+    if (error instanceof GateConflictError) return res.status(409).json({ message: error.message, code: error.code, fresh: error.fresh });
+    res.status(400).json({ message: error instanceof Error ? error.message : '保存冲突处置失败' });
+  }
+});
 app.post('/api/gate/appointments', (req, res) => { try { res.status(201).json(createGateAppointment(req.body)); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '预约失败' }); } });
 app.patch('/api/gate/appointments/:id', (req, res) => { try { const result = editGateAppointment(req.params.id, req.body); if (!result) return res.status(404).json({ message: '预约不存在' }); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '更新预约失败' }); } });
 app.delete('/api/gate/appointments/:id', (req, res) => { const result = deleteGateAppointment(req.params.id); if (!result) return res.status(404).json({ message: '预约不存在' }); res.json({ deleted: true, id: result.id }); });

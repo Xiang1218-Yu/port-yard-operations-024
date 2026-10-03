@@ -1,10 +1,10 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { ApiConflictError, Conflict, ConflictResolveResult, ConflictCard, ConflictResolver, laneLabel } from './gate-conflicts';
 
 type Dashboard = { activeVoyages: number; berthMoves: number; yardUtilization: number; gateQueue: number; pendingTasks: number; blockedTasks: number; reeferAlerts: number; hazmatHolds: number; lateVessels: number };
 type Voyage = { id: string; vessel: string; service: string; eta: string; etd: string; status: string; berth: string; movesPlanned: number; movesDone: number; lateRisk: string };
 type Container = { id: string; voyageId: string; size: '20'|'40'|'45'; isoType: string; direction: 'import'|'export'|'transshipment'; status: string; weightT: number; reefer: boolean; temperature?: number; hazmatClass?: string; customs: 'released'|'inspection'|'hold'; priority: string; yardSlot: string; appointmentId?: string; lastEvent: string };
 type Block = { id: string; zone: string; capacity: number; occupied: number; reeferPlugs: number; usedPlugs: number; hazmatAllowed: boolean; heat: number; utilization: number; freeSlots: number; pressure: string };
-type Conflict = { severity: string; appointmentId: string; reason: string };
 type Appointment = { id: string; containerId: string; truckNo: string; driver: string; type: 'pickup'|'dropoff'; windowStart: string; windowEnd: string; lane: 'north'|'south'|'rail'; status: string; exception?: string };
 type Task = { id: string; kind: string; containerId: string; from: string; to: string; equipmentId?: string; priority: number; score: number; status: string; blockingReasons: string[]; estimatedMinutes: number; scheduledAt: string };
 type Equipment = { id: string; name: string; kind: string; status: string; location: string; battery: number; queue: number; movesPerHour: number };
@@ -27,7 +27,12 @@ const defaultValues = (entity: Editor['entity']): Record<string, string|boolean>
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${api}${path}`, { ...init, headers: { ...(init?.body ? { 'Content-Type': 'application/json' } : {}), ...init?.headers } });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.message || `请求失败 (${response.status})`);
+  if (!response.ok) {
+    const error = new Error(body.message || `请求失败 (${response.status})`) as ApiConflictError;
+    error.code = body.code;
+    error.fresh = body.fresh;
+    throw error;
+  }
   return body as T;
 }
 
@@ -43,6 +48,8 @@ export default function App() {
   const [tab, setTab] = useState<Section>('control');
   const [selectedVoyage, setSelectedVoyage] = useState('VOY-AX7');
   const [editor, setEditor] = useState<Editor>();
+  const [resolver, setResolver] = useState<{ conflict: Conflict; appointmentId: string; mode: 'window' | 'lane'; appointment: Appointment }>();
+  const [locatedId, setLocatedId] = useState<string>();
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -54,6 +61,7 @@ export default function App() {
       request<Task[]>('/tasks'), request<Equipment[]>('/equipment')
     ]);
     setDashboard(d); setVoyages(v); setContainers(ctn); setBlocks(b); setConflicts(cf); setAppointments(a); setTasks(t); setEquipment(e);
+    return { cf, a };
   }, []);
   useEffect(() => { void load().catch(reason => setError(reason instanceof Error ? reason.message : '无法连接服务端')); }, [load]);
 
@@ -93,6 +101,42 @@ export default function App() {
   };
   const updateAppointmentStatus = async (id: string, status: string) => mutate(`/gate/appointments/${id}`, 'PATCH', { status });
   const assign = async (id: string, equipmentId: string) => equipmentId ? mutate(`/tasks/${id}/assign`, 'PATCH', { equipmentId }) : mutate(`/tasks/${id}`, 'PATCH', { equipmentId: '', status: 'queued' });
+  const locateAppointment = (id: string) => {
+    setTab('gate');
+    setLocatedId(id);
+    requestAnimationFrame(() => {
+      document.querySelectorAll<HTMLElement>('[data-appointment-row].locate-flash').forEach(row => row.classList.remove('locate-flash'));
+      const row = document.querySelector<HTMLElement>(`[data-appointment-row="${id}"]`);
+      row?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      row?.classList.add('locate-flash');
+    });
+  };
+  const openResolver = (conflict: Conflict, appointmentId: string, mode: 'window' | 'lane') => {
+    const target = appointments.find(item => item.id === appointmentId);
+    if (!target) {
+      setError('该预约已不存在，正在重新读取最新预约与冲突数据…');
+      void load().then(() => setError('数据已刷新，请按最新冲突列表选择可处理的预约。')).catch(reason => setError(reason instanceof Error ? reason.message : '数据刷新失败，请稍后重试'));
+      return;
+    }
+    setError('');
+    setResolver({ conflict, appointmentId, mode, appointment: target });
+  };
+  const handleResolverFailure = async (reason: unknown) => {
+    const apiError = reason as ApiConflictError;
+    setResolver(undefined);
+    await load().catch(() => undefined);
+    if (apiError?.code === 'CONFLICT_STALE') setError('该冲突已被其他值班员处理，列表已重新读取——请确认最新冲突后继续处理。');
+    else if (apiError?.code === 'APPOINTMENT_CHANGED') setError('预约状态已被其他人变更（如已签到/取消），无法再直接调整；数据已刷新，可在最新的预约行上继续操作。');
+    else if (apiError?.code === 'CUSTOMS_BLOCKED') setError('该提箱海关未放行，调整时隙或车道都无法放行；数据已刷新，请等待海关放行或转查验流程。');
+    else if (apiError?.code === 'NOT_FOUND') setError('预约已被删除，冲突列表已重新读取，请选择最新的冲突继续处理。');
+    else setError(`${apiError?.message ?? '保存失败'}。已重新读取最新数据，可修正后重试。`);
+  };
+  const handleResolverSaved = async (result: ConflictResolveResult) => {
+    setResolver(undefined);
+    await load().catch(() => undefined);
+    void result;
+    setMessage('冲突处置已保存，预约与冲突结果已按服务端最新数据刷新');
+  };
   const selected = voyages.find(voyage => voyage.id === selectedVoyage);
   const remaining = selected ? selected.movesPlanned - selected.movesDone : 0;
   const maxHeat = useMemo(() => Math.max(...blocks.map(block => block.heat), 1), [blocks]);
@@ -107,7 +151,20 @@ export default function App() {
     <nav className="tabs"><button className={tab==='control'?'active':''} onClick={() => setTab('control')}>作业驾驶舱</button><button className={tab==='containers'?'active':''} onClick={() => setTab('containers')}>箱务台账 / CRUD</button><button className={tab==='gate'?'active':''} onClick={() => setTab('gate')}>闸口预约</button><button className={tab==='yard'?'active':''} onClick={() => setTab('yard')}>堆场热区</button><button className={tab==='tasks'?'active':''} onClick={() => setTab('tasks')}>设备任务</button><span>最后同步 {new Date().toLocaleTimeString()}</span></nav>
     {tab === 'control' && <div className="layout"><section className="panel vessel-panel"><div className="panel-head"><div><div className="eyebrow">VESSEL WINDOW / 船期窗口</div><h2>泊位作业进度</h2></div><span className="muted">剩余作业动态计算</span></div>{voyages.map(voyage => <button key={voyage.id} className={`vessel ${selectedVoyage===voyage.id?'selected':''}`} onClick={() => setSelectedVoyage(voyage.id)}><span className={`vessel-dot ${voyage.status}`}/><span className="vessel-main"><b>{voyage.vessel}</b><small>{voyage.id} · {voyage.service} · {voyage.berth}</small><i><em style={{ width: `${Math.min(100, voyage.movesDone / voyage.movesPlanned * 100)}%` }}/></i></span><span className="vessel-move"><b>{voyage.movesDone.toLocaleString()}</b><small>/ {voyage.movesPlanned.toLocaleString()} moves</small></span><strong className={voyage.lateRisk}>{voyage.lateRisk==='high'?'HIGH':voyage.lateRisk==='medium'?'WATCH':'ON TIME'}</strong></button>)}</section><section className="panel focus-panel"><div className="panel-head"><div><div className="eyebrow">SELECTED VOYAGE / {selected?.id}</div><h2>{selected?.vessel}</h2></div><span className={`badge ${selected?.lateRisk}`}>{selected?.status}</span></div><div className="voyage-stats"><div><small>ETA</small><b>{selected&&time(selected.eta)}</b><span>预计靠泊</span></div><div><small>ETD</small><b>{selected&&time(selected.etd)}</b><span>计划离港</span></div><div><small>REMAINING</small><b>{remaining}</b><span>剩余翻箱</span></div></div><div className="berth-map"><div className="water"><span>岸线 / BERTH</span><i className="ship" style={{ left: `${selected?.berth==='B07'?50:24}%` }}>{selected?.vessel}</i><b>B01</b><b>B04</b><b>B07</b><b>B10</b></div></div><div className="callout"><strong>调度策略</strong><span>已把 {dashboard.blockedTasks} 个阻塞任务、{dashboard.gateQueue} 车闸口压力纳入当前窗口；优先保护冷藏与危险品安全约束。</span></div></section><section className="panel wide"><div className="panel-head"><h3>异常与联动信号</h3><span>{conflicts.length} gate conflicts detected</span></div><div className="signal-grid"><div><strong className="critical">{dashboard.blockedTasks}</strong><span>设备/约束阻塞</span><small>最高优先级：海关查验任务</small></div><div><strong className="warning">{conflicts.length}</strong><span>闸口预约冲突</span><small>同车重叠窗口需人工重排</small></div><div><strong className="warning">{dashboard.reeferAlerts}</strong><span>冷藏与温控风险</span><small>查验区电源余量接近阈值</small></div><div><strong className="ok">{equipment.filter(item => item.status==='available').length}</strong><span>可调度设备</span><small>场桥 / 正面吊 / 集卡</small></div></div></section></div>}
     {tab === 'containers' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">CONTAINER REGISTER / CRUD</div><h2>箱务台账</h2><span className="muted">新增、查询、编辑、删除；危险品与冷藏箱受堆场约束校验</span></div><button className="primary-action" onClick={() => openCreate('container')}>＋ 新增箱务</button></div><div className="table container-table"><div className="tr th"><span>箱号 / 航次</span><span>尺寸 / 流向</span><span>箱况 / 海关</span><span>堆位</span><span>重量 / 属性</span><span>操作</span></div>{containers.map(container => <div className="tr" key={container.id}><span><b>{container.id}</b><small>{container.voyageId} · {container.lastEvent}</small></span><span>{container.size}ft · {container.direction}<small>{container.isoType}</small></span><span><b>{container.status}</b><small>海关：{container.customs}</small></span><span>{container.yardSlot}</span><span>{container.weightT}t<small>{container.reefer?`冷藏 ${container.temperature}°C`:container.hazmatClass?`危险品 ${container.hazmatClass} 类`:'普通箱'}</small></span><span className="row-actions"><button onClick={() => openEdit('container', container.id, { ...container, weightT: String(container.weightT), temperature: String(container.temperature ?? 4), hazmatClass: container.hazmatClass ?? '' })}>编辑</button><button className="danger-action" onClick={() => void remove('container', container.id)}>删除</button></span></div>)}</div></section>}
-    {tab === 'gate' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">GATE APPOINTMENT / SLOT CONTROL</div><h2>闸口预约与车道状态</h2><span className="muted">支持新增预约、编辑时隙、签到/完成和删除</span></div><button className="primary-action" onClick={() => openCreate('appointment')}>＋ 新增预约</button></div>{conflicts.map(conflict => <div className="conflict" key={`${conflict.appointmentId}-${conflict.reason}`}><strong>{conflict.severity}</strong><b>{conflict.appointmentId}</b><span>{conflict.reason}</span></div>)}<div className="table"><div className="tr th"><span>预约</span><span>箱号 / 车辆</span><span>窗口</span><span>车道</span><span>状态</span><span>操作</span></div>{appointments.map(appointment => <div className="tr" key={appointment.id}><span><b>{appointment.id}</b><small>{appointment.type}</small></span><span><b>{appointment.containerId}</b><small>{appointment.truckNo} · {appointment.driver}</small></span><span>{time(appointment.windowStart)}—{time(appointment.windowEnd)}</span><span>{appointment.lane}</span><span className={`pill ${appointment.status}`}>{appointment.status}</span><span className="row-actions">{appointment.status==='booked'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'checked-in')}>签到</button>:appointment.status==='checked-in'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'completed')}>完成</button>:null}<button onClick={() => openEdit('appointment', appointment.id, { ...appointment, windowStart: toLocalInput(appointment.windowStart), windowEnd: toLocalInput(appointment.windowEnd) })}>编辑</button><button className="danger-action" onClick={() => void remove('appointment', appointment.id)}>删除</button></span></div>)}</div></section>}
+    {tab === 'gate' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">GATE APPOINTMENT / SLOT CONTROL</div><h2>闸口预约与车道状态</h2><span className="muted">冲突卡片可直接定位预约并快速调整窗口/车道，保存前预检对方预约与最新冲突</span></div><button className="primary-action" onClick={() => openCreate('appointment')}>＋ 新增预约</button></div>
+      <div className="conflict-summary">
+        <span className="summary-critical"><b>{conflicts.filter(c => c.severity === 'critical').length}</b> 同车重叠</span>
+        <span className="summary-warning"><b>{conflicts.filter(c => c.kind === 'lane-contention').length}</b> 车道占用</span>
+        <span className="summary-customs"><b>{conflicts.filter(c => c.kind === 'customs-pickup-hold').length}</b> 海关未放行提箱</span>
+      </div>
+      {conflicts.map(conflict => <ConflictCard key={conflict.id} conflict={conflict} onLocate={locateAppointment} onResolve={openResolver} />)}
+      {conflicts.length === 0 && <div className="no-conflict">当前闸口窗口无冲突。</div>}
+      <div className="table"><div className="tr th"><span>预约</span><span>箱号 / 车辆</span><span>窗口</span><span>车道</span><span>状态</span><span>操作</span></div>{appointments.map(appointment => {
+        const relatedConflicts = conflicts.filter(c => c.parties.some(p => p.appointmentId === appointment.id));
+        const customsHold = relatedConflicts.some(c => c.kind === 'customs-pickup-hold');
+        return <div className={`tr${locatedId === appointment.id ? ' located' : ''}${customsHold ? ' customs-row' : ''}`} key={appointment.id} data-appointment-row={appointment.id}><span><b>{appointment.id}</b><small>{appointment.type}{relatedConflicts.length ? ` · ${relatedConflicts.map(c => c.kind === 'truck-overlap' ? '同车冲突' : c.kind === 'lane-contention' ? '车道占用' : '海关未放行').join('、')}` : ''}</small></span><span><b>{appointment.containerId}</b><small>{appointment.truckNo} · {appointment.driver}</small></span><span>{time(appointment.windowStart)}—{time(appointment.windowEnd)}</span><span>{laneLabel[appointment.lane]}</span><span className={`pill ${appointment.status}`}>{appointment.status}</span><span className="row-actions">{appointment.status==='booked'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'checked-in')}>签到</button>:appointment.status==='checked-in'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'completed')}>完成</button>:null}<button onClick={() => openEdit('appointment', appointment.id, { ...appointment, windowStart: toLocalInput(appointment.windowStart), windowEnd: toLocalInput(appointment.windowEnd) })}>编辑</button><button className="danger-action" onClick={() => void remove('appointment', appointment.id)}>删除</button></span></div>;
+      })}</div></section>}
+    {resolver && <ConflictResolver conflict={resolver.conflict} appointmentId={resolver.appointmentId} initialMode={resolver.mode} appointment={resolver.appointment} onClose={() => setResolver(undefined)} onSaved={handleResolverSaved} onFailure={handleResolverFailure} postJson={(path, body) => request(path, { method: 'POST', body: JSON.stringify(body) })} />}
     {tab === 'yard' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">YARD HEATMAP / STACK DENSITY</div><h2>堆场容量与安全约束</h2></div><span className="muted">实时区块压力</span></div><div className="yard-grid">{blocks.map(block => <div className={`block ${block.pressure}`} key={block.id}><div className="block-top"><b>{block.id}</b><strong>{pct(block.utilization)}</strong></div><span>{block.zone}</span><div className="heat"><i style={{ width: `${block.heat / maxHeat * 100}%` }}/></div><div className="block-stats"><span>空位 {block.freeSlots}</span><span>冷插 {block.usedPlugs}/{block.reeferPlugs}</span><span>{block.hazmatAllowed?'危险品可入':'普通区'}</span></div></div>)}</div><div className="yard-note"><span>堆位推荐会同时考虑容量、热区、危险品隔离、冷藏插座和设备可达性。</span><b>A01 → C03 重排建议可释放 21 个低热度堆位</b></div></section>}
     {tab === 'tasks' && <div className="layout"><section className="panel wide"><div className="panel-head"><div><div className="eyebrow">TASK DISPATCH / EQUIPMENT POOL</div><h2>场内任务优先级与设备指派</h2><span className="muted">支持新增、编辑、删除和设备指派</span></div><button className="primary-action" onClick={() => openCreate('task')}>＋ 新建任务</button></div><div className="table task-table"><div className="tr th"><span>任务</span><span>箱号</span><span>路径</span><span>优先级</span><span>状态</span><span>设备 / 操作</span></div>{tasks.map(task => <div className="tr" key={task.id}><span><b>{task.id}</b><small>{task.kind} · {task.estimatedMinutes}min</small></span><span>{task.containerId}</span><span>{task.from} → {task.to}</span><span className={task.score>95?'critical':''}>{task.score}</span><span><span className={`pill ${task.status}`}>{task.status}</span>{task.blockingReasons.length>0&&<small className="blocked-text">{task.blockingReasons[0]}</small>}</span><span className="task-actions"><select value={task.equipmentId??''} onChange={event => void assign(task.id, event.target.value)}><option value="">未指派</option>{equipment.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button onClick={() => openEdit('task', task.id, { kind: task.kind, containerId: task.containerId, from: task.from, to: task.to, equipmentId: task.equipmentId ?? '', priority: String(task.priority), estimatedMinutes: String(task.estimatedMinutes), scheduledAt: toLocalInput(task.scheduledAt), status: task.status })}>编辑</button><button className="danger-action" onClick={() => void remove('task', task.id)}>删除</button></span></div>)}</div></section><section className="panel"><div className="panel-head"><h3>设备池</h3><span>{equipment.length} assets</span></div>{equipment.map(item => <div className="equipment" key={item.id}><i className={`equip-dot ${item.status}`}/><div><b>{item.name}</b><small>{item.location} · 队列 {item.queue}</small></div><strong>{item.battery}%</strong></div>)}</section></div>}
     <footer>HarborGrid · 内存种子数据 + REST API · 箱务台账、闸口预约、场内任务提供完整增删改查操作</footer>
